@@ -87,7 +87,14 @@ jobs:
       - name: Apply SUSFS kernel patch (4.19)
         run: |
           cd kernel
+          # vendor 4.19 的 fdinfo.c 用局部 `u32 mask=mark->mask`, 没有新内核 helper inotify_mark_user_mask;
+          # 50 补丁该文件 hunk 会被 -F3 打坏(implicit declaration / expected expression / undeclared mask)。
+          # 该文件只负责 /proc fdinfo 内 sus_kstat 的"展示隐藏"(非root隐藏主路径), 直接保留原厂: 先备份后还原。
+          cp fs/notify/fdinfo.c /tmp/fdinfo.orig
           patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || echo "Some hunks failed - .rej kept for the non-KABI manual-fix step"
+          cp /tmp/fdinfo.orig fs/notify/fdinfo.c
+          rm -f fs/notify/fdinfo.c.rej fs/notify/fdinfo.c.orig
+          echo "fdinfo.c restored to stock (vendor 4.19 has no inotify_mark_user_mask)"
           echo "=== rejected hunks (sched.h/mount.h expected; fixed next) ==="
           find . -name "*.rej" -print 2>/dev/null || true
           find . -name "*.orig" -delete 2>/dev/null || true
