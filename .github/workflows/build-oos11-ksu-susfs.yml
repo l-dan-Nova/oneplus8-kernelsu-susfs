@@ -383,12 +383,19 @@ jobs:
       - name: Build Kernel
         run: |
           cd kernel
+          # ACK 顶层 Makefile 用 `cc-option,-Werror=<diag>` 把 strict-prototypes/implicit-int/date-time/
+          # incompatible-pointer-types/designated-init 逐档升为 error。其中 designated-init 是 GCC 专属、
+          # clang 无此警告组, 配合 CLANG_FLAGS 的 -Werror=unknown-warning-option 会因"未知选项"直接报错;
+          # 其余几项 vendor 老代码(如 memplus_core.c 空参函数)也会触发。从源头删掉这些具名升错行, 回归普通 warning。
+          sed -i '/cc-option,-Werror=/d' Makefile
+          sed -i 's/-Werror-implicit-function-declaration//' Makefile
+          echo "=== named cc-option -Werror lines after strip (expect none) ==="
+          grep -n "cc-option,-Werror=" Makefile && { echo "FATAL: named -Werror=diag not stripped"; exit 1; } || echo "named -Werror=diag stripped OK"
           yes "" | make -j$(nproc --all) O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LLVM_IAS=1 HOSTCFLAGS=-fcommon LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            KCFLAGS="-Wno-error -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=date-time -Wno-error=incompatible-pointer-types -Wno-error=designated-init -Wno-error=implicit-function-declaration -Wno-strict-prototypes" \
+            LLVM_IAS=1 HOSTCFLAGS=-fcommon KCFLAGS=-Wno-error LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip 2>&1 | tee build.log
           echo "=== result ==="
           ls -la out/arch/arm64/boot/Image* || true
