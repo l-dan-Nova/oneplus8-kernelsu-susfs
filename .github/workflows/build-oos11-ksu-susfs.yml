@@ -403,6 +403,17 @@ jobs:
           sed -i 's/-Werror-implicit-function-declaration//' Makefile
           echo "=== named cc-option -Werror lines after strip (expect none) ==="
           grep -n "cc-option,-Werror=" Makefile && { echo "FATAL: named -Werror=diag not stripped"; exit 1; } || echo "named -Werror=diag stripped OK"
+          # 子目录(如 drivers/vservices/Makefile: ccflags-y += -Werror)会私自开 -Werror, 且其 ccflags-y
+          # 在命令行中位于 KCFLAGS 之后, 覆盖 -Wno-error, 导致该目录 -Wunused-but-set-variable 等升 error。
+          # 递归清除所有【子目录】Makefile/Kbuild 里的 bare -Werror 与 -Werror=<diag>(-mindepth 2 排除顶层,
+          # 以保留顶层 CLANG_FLAGS 的 -Werror=unknown-warning-option 拼写守卫); -Wno-error 不被匹配。
+          find . -mindepth 2 -type f \( -name Makefile -o -name Kbuild \) -print0 \
+            | xargs -0 -r sed -i -E 's/-Werror(=[A-Za-z0-9_-]+)?//g'
+          echo "=== residual subdir -Werror (expect none) ==="
+          if grep -rn --include=Makefile --include=Kbuild -e "-Werror" . | grep -v "unknown-warning-option" | grep -q .; then
+            grep -rn --include=Makefile --include=Kbuild -e "-Werror" . | grep -v "unknown-warning-option"
+            echo "FATAL: subdir -Werror not fully stripped"; exit 1
+          else echo "subdir -Werror stripped OK"; fi
           # 编译前再非交互收敛一次配置(工具链变量与编译完全一致), 杜绝残余 (NEW) 交互提问
           make O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- \
