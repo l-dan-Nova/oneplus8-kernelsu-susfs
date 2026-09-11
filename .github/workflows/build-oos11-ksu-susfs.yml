@@ -384,6 +384,13 @@ jobs:
           # 显式关闭 LTO(又慢又易在链接翻车) 与 RELR(仅打包优化, 无功能影响), 消除 choice/NEW。
           scripts/config --file out/.config -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d LTO_NONE 2>/dev/null || true
           scripts/config --file out/.config -d RELR 2>/dev/null || true
+          # ★让原厂 vendor 的 44 个 .ko 能被自编译内核加载: 关模块签名强制/签名/符号CRC。
+          # 原厂 defconfig 开了 MODULE_SIG_FORCE+MODULE_SIG+MODVERSIONS; 自编译内核内置签名公钥
+          # (源码树新生成)与 genksyms CRC(换 clang14)都和原厂 .ko 对不上 -> insmod 全被拒,
+          # 实测 /proc/modules=0、28 个 audio_*.ko 加载不了致 audioserver TimeCheck 反复崩。
+          # 必须保留 MODULES=y、MODULE_UNLOAD=y, 使 vermagic(4.19.110-perf+ SMP mod_unload preempt aarch64)
+          # 与原厂 ko 逐字一致; 上述三项不进 vermagic, 关闭不改变 vermagic 字符串。
+          scripts/config --file out/.config -d MODULE_SIG_FORCE -d MODULE_SIG -d MODVERSIONS 2>/dev/null || true
           make $MK olddefconfig
           # 再跑一次 olddefconfig 必须幂等(不再改动/不再有 NEW); 用其输出兜底确认配置已收敛
           make $MK olddefconfig
@@ -398,6 +405,14 @@ jobs:
             exit 1
           fi
           echo "OK: CONFIG_KSU=y, KernelSU 将被内建编译"
+          echo "=== module load gate (MODULES/UNLOAD=y; SIG/MODVERSIONS not set) ==="
+          grep -E "^CONFIG_MODULES|^CONFIG_MODULE_UNLOAD|^CONFIG_MODVERSIONS|^CONFIG_MODULE_SIG" out/.config
+          if grep -qE "^CONFIG_MODVERSIONS=y|^CONFIG_MODULE_SIG(=|_FORCE)=y|^CONFIG_MODULE_SIG_FORCE=y" out/.config; then
+            echo "FATAL: 模块签名/CRC 校验仍开启, 原厂 .ko 将无法加载, 终止以免白编译"; exit 1
+          fi
+          if ! grep -q "^CONFIG_MODULES=y" out/.config; then echo "FATAL: CONFIG_MODULES 被意外关闭"; exit 1; fi
+          if ! grep -q "^CONFIG_MODULE_UNLOAD=y" out/.config; then echo "FATAL: CONFIG_MODULE_UNLOAD 丢失会导致 vermagic 与原厂 ko 不一致"; exit 1; fi
+          echo "OK: 模块加载门控通过(原厂 .ko 可加载)"
           grep -c "kernelsu" drivers/Makefile
           grep -n "kernelsu/Kconfig" drivers/Kconfig
 
