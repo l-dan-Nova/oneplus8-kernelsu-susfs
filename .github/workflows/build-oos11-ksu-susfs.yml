@@ -351,10 +351,10 @@ jobs:
 
       - name: Tolerate vendor module CRC mismatch (kernel/module.c)
         run: |
-          # 脚本参数传仓库根(其下为 kernel/module.c); 保留 MODVERSIONS(vermagic 一致) 的同时,
-          # 让 check_version 命中 bad_version 时放行, 避免个别原厂 .ko 符号 CRC 不一致被拒
-          # (模块签名在下面 Configure 里另关 MODULE_SIG_FORCE/MODULE_SIG)。
-          python3 $GITHUB_WORKSPACE/scripts/patch_module_crc.py "$GITHUB_WORKSPACE"
+          # clone 的源码根目录就叫 kernel/, module.c 在源码根的 kernel/ 子目录 -> kernel/kernel/module.c。
+          # 对齐 manual hooks: 先 cd kernel 进入源码根, 把 $(pwd)=源码根 传给脚本(脚本内部拼 kernel/module.c)。
+          cd kernel
+          python3 $GITHUB_WORKSPACE/scripts/patch_module_crc.py "$(pwd)"
           grep -n "tolerate vendor .ko CRC mismatch" kernel/module.c
 
       - name: Configure (vendor/kona-perf_defconfig + kebab)
