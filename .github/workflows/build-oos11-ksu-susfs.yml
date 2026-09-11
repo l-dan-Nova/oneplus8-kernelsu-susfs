@@ -1,0 +1,329 @@
+name: Build OOS11 kebab KernelSU+SUSFS (4.19 non-GKI)
+
+# 为 一加8T(kebab) 氢OS11 / Android11 / 内核 4.19.110 定制
+# 源码: OnePlusOSS SM8250_R_11.0 (4.19.110) ; defconfig: vendor/kona-perf_defconfig ; OEM_TARGET_PRODUCT=kebab
+# 组合: tiann KernelSU + susfs4ksu(kernel-4.19) + 非GKI手动hook ; 产物仅 AnyKernel3(只换kernel, 保留原厂ramdisk)
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_SOURCE: https://github.com/OnePlusOSS/android_kernel_oneplus_sm8250.git
+  KERNEL_BRANCH: oneplus/SM8250_R_11.0
+  DEFCONFIG: vendor/kona-perf_defconfig
+  OEM_PRODUCT: kebab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl wget bc bison build-essential flex \
+            libssl-dev libelf-dev python3 cpio zip lz4
+
+      - name: Setup Clang
+        run: |
+          mkdir -p toolchains/clang
+          curl -sL "https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20250704-release/Clang-14.0.6-20250704.tar.gz" | \
+            tar -xzf - -C toolchains/clang
+          echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
+
+      - name: Setup GCC
+        run: |
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            toolchains/gcc64
+          git clone --depth=1 -b android12L-release \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            toolchains/gcc32
+          echo "$GITHUB_WORKSPACE/toolchains/gcc64/bin" >> $GITHUB_PATH
+          echo "$GITHUB_WORKSPACE/toolchains/gcc32/bin" >> $GITHUB_PATH
+
+      - name: Clone Kernel (OnePlusOSS OOS11 4.19.110)
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" kernel
+          cd kernel
+          echo "=== kernel version ==="
+          head -5 Makefile
+
+      - name: Clone susfs4ksu (kernel-4.19)
+        run: |
+          git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+          git clone --depth=1 -b kernel-4.19 https://github.com/sidex15/susfs4ksu.git susfs4ksu
+          ls -la susfs4ksu/kernel_patches/ || true
+
+      - name: Fix vDSO for Clang
+        run: |
+          cd kernel
+          for V in arch/arm64/kernel/vdso/Makefile arch/arm64/kernel/vdso32/Makefile; do
+            if [ -f "$V" ] && ! grep -q -- "-g0" "$V"; then echo 'ccflags-y += -g0' >> "$V"; fi
+          done
+
+      - name: Copy SUSFS kernel files
+        run: |
+          cd kernel
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/susfs.c fs/
+          cp $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/*.h include/linux/
+          ls -la fs/susfs.c include/linux/susfs*.h
+
+      - name: Apply SUSFS kernel patch (4.19)
+        run: |
+          cd kernel
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || echo "Some hunks failed - inspect below"
+          find . -name "*.rej" -print -exec cat {} \; 2>/dev/null || true
+          find . -name "*.rej" -delete 2>/dev/null || true
+          find . -name "*.orig" -delete 2>/dev/null || true
+          if ! grep -q "susfs.o" fs/Makefile; then
+            sed -i '/^obj-y.*:=/a obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
+          fi
+          grep -n "susfs" fs/Makefile || true
+
+      - name: Backport path_umount / can_umount / get_cred_rcu for 4.19
+        run: |
+          cd kernel
+          if ! grep -q "^static int can_umount" fs/namespace.c; then
+            cat >> fs/namespace.c << 'EOFPATCH'
+
+          /* Backport can_umount for SUSFS/KernelSU */
+          static int can_umount(const struct path *path, int flags)
+          {
+              struct mount *mnt = real_mount(path->mnt);
+              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+                  return -EINVAL;
+              if (!may_mount())
+                  return -EPERM;
+              if (path->dentry != path->mnt->mnt_root)
+                  return -EINVAL;
+              if (!check_mnt(mnt))
+                  return -EINVAL;
+              if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                  return -EINVAL;
+              if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+                  return -EPERM;
+              return 0;
+          }
+          int path_umount(struct path *path, int flags)
+          {
+              struct mount *mnt = real_mount(path->mnt);
+              int ret = can_umount(path, flags);
+              if (!ret)
+                  ret = do_umount(mnt, flags);
+              dput(path->dentry);
+              mntput_no_expire(mnt);
+              return ret;
+          }
+          EXPORT_SYMBOL(path_umount);
+          EOFPATCH
+          fi
+          if ! grep -q "int path_umount" fs/internal.h; then
+            sed -i '/^extern void __init mnt_init/a int path_umount(struct path *path, int flags);' fs/internal.h
+          fi
+          if ! grep -q "get_cred_rcu" include/linux/cred.h; then
+            cat > /tmp/get_cred_rcu.txt << 'EOFCRED'
+
+          /* Backport get_cred_rcu for KernelSU */
+          static inline const struct cred *get_cred_rcu(const struct cred *cred)
+          {
+              struct cred *nonconst_cred = (struct cred *) cred;
+              if (!cred)
+                  return NULL;
+              if (!atomic_inc_not_zero(&nonconst_cred->usage))
+                  return NULL;
+              return cred;
+          }
+          EOFCRED
+            LINE=$(grep -n "^static inline void put_cred" include/linux/cred.h | head -1 | cut -d: -f1)
+            if [ -n "$LINE" ]; then
+              head -n $((LINE - 1)) include/linux/cred.h > /tmp/cred_new.h
+              cat /tmp/get_cred_rcu.txt >> /tmp/cred_new.h
+              tail -n +$LINE include/linux/cred.h >> /tmp/cred_new.h
+              mv /tmp/cred_new.h include/linux/cred.h
+            fi
+          fi
+          echo 'CFLAGS_namespace.o += -Wno-unused-function' >> fs/Makefile
+
+      - name: Setup KernelSU (tiann)
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          if [ ! -d "drivers/kernelsu" ]; then echo "ERROR: KernelSU setup failed!"; exit 1; fi
+          ls -la drivers/kernelsu/ | head
+
+      - name: Apply SUSFS patch to KernelSU driver
+        run: |
+          cd kernel
+          KSU_DIR=$(readlink -f drivers/kernelsu)
+          KSU_PARENT=$(dirname "$KSU_DIR")
+          if [ -f "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "$KSU_PARENT/"
+            cd "$KSU_PARENT"
+            patch -p1 -F3 --dry-run < 10_enable_susfs_for_ksu.patch 2>&1 || true
+            patch -p1 -F3 < 10_enable_susfs_for_ksu.patch 2>&1 || true
+            find . -name "*.rej" -delete 2>/dev/null || true
+            find . -name "*.orig" -delete 2>/dev/null || true
+            rm -f 10_enable_susfs_for_ksu.patch
+          fi
+          cd "$GITHUB_WORKSPACE/kernel"
+          if ! grep -q "CONFIG_KSU_SUSFS" "$KSU_DIR/Kconfig"; then
+            echo "SUSFS Kconfig missing -> manual add"
+            cat >> "$KSU_DIR/Kconfig" << 'EOFK'
+
+          menu "KernelSU - SUSFS"
+          config KSU_SUSFS
+              bool "KernelSU addon - SUSFS"
+              depends on KSU
+              default y
+          config KSU_SUSFS_SUS_PATH
+              bool "sus_path"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_SUS_MOUNT
+              bool "sus_mount"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+              bool "auto sus ksu mount"
+              depends on KSU_SUSFS_SUS_MOUNT
+              default y
+          config KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+              bool "auto sus bind mount"
+              depends on KSU_SUSFS_SUS_MOUNT
+              default y
+          config KSU_SUSFS_SUS_KSTAT
+              bool "sus_kstat"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_TRY_UMOUNT
+              bool "try_umount"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+              bool "auto try_umount bind"
+              depends on KSU_SUSFS_TRY_UMOUNT
+              default y
+          config KSU_SUSFS_SPOOF_UNAME
+              bool "spoof_uname"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_ENABLE_LOG
+              bool "susfs log"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+              bool "hide symbols"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+              bool "spoof cmdline"
+              depends on KSU_SUSFS
+              default y
+          config KSU_SUSFS_OPEN_REDIRECT
+              bool "open_redirect"
+              depends on KSU_SUSFS
+              default y
+          endmenu
+          EOFK
+          fi
+          grep -c "susfs" "$KSU_DIR/core_hook.c" 2>/dev/null || echo "core_hook susfs refs=0"
+
+      - name: Disable kprobes (force manual hooks)
+        run: |
+          cd kernel/drivers/kernelsu
+          for f in *.c *.h; do
+            if [ -f "$f" ]; then
+              sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' "$f"
+              sed -i 's/#if defined(CONFIG_KPROBES)/#if defined(CONFIG_KPROBES) \&\& 0/g' "$f"
+            fi
+          done
+          echo "ccflags-y += -DKSU_UMOUNT" >> Makefile
+
+      - name: Add manual KSU hooks for non-GKI
+        run: |
+          cd kernel
+          bash $GITHUB_WORKSPACE/scripts/add-ksu-hooks.sh
+          echo "=== hook anchor verification ==="
+          echo "-- exec.c:"; grep -c "ksu_handle_execveat" fs/exec.c || true
+          echo "-- open.c:"; grep -c "ksu_handle_faccessat" fs/open.c || true
+          echo "-- stat.c:"; grep -c "ksu_handle_stat" fs/stat.c || true
+          echo "-- reboot.c:"; grep -c "ksu_handle_sys_reboot" kernel/reboot.c || true
+
+      - name: Configure (vendor/kona-perf_defconfig + kebab)
+        run: |
+          cd kernel
+          mkdir -p out
+          make O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            $DEFCONFIG
+          scripts/config --file out/.config -e KSU
+          for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
+            KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            KSU_SUSFS_SUS_KSTAT KSU_SUSFS_TRY_UMOUNT KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_OPEN_REDIRECT KALLSYMS KALLSYMS_ALL; do
+            scripts/config --file out/.config -e $c
+          done
+          # 非GKI手动hook需要
+          scripts/config --file out/.config -d KPROBES 2>/dev/null || true
+          make O=out ARCH=arm64 olddefconfig
+          echo "=== KSU/SUSFS config ==="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config | head -40
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          yes "" | make -j$(nproc --all) O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip 2>&1 | tee build.log
+          echo "=== result ==="
+          ls -la out/arch/arm64/boot/Image* || true
+          if [ ! -f out/arch/arm64/boot/Image ]; then echo "BUILD FAILED"; tail -80 build.log; exit 1; fi
+
+      - name: Package AnyKernel3 (kernel only, keep stock ramdisk)
+        run: |
+          cd kernel
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          rm -rf .git modules patch ramdisk
+          cp ../out/arch/arm64/boot/Image .
+          # 关闭机型名校验(直接刷kebab); A/B 设备; 只写 boot 分区
+          sed -i 's/do.devicecheck=.*/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/do.modules=.*/do.modules=0/g' anykernel.sh
+          sed -i 's/do.cleanup=.*/do.cleanup=1/g' anykernel.sh
+          sed -i 's|block=.*|block=/dev/block/bootdevice/by-name/boot;|g' anykernel.sh
+          sed -i 's/is_slot_device=.*/is_slot_device=1;/g' anykernel.sh
+          ZIP_NAME="KSU-SUSFS_OOS11_kebab_4.19.110_$(date +%Y%m%d_%H%M).zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" * -x .git README.md *placeholder
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          ls -lh "$GITHUB_WORKSPACE/$ZIP_NAME"
+
+      - name: Upload AnyKernel3 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: oos11-kebab-${{ github.run_number }}
+          name: OOS11 kebab KernelSU+SUSFS Build ${{ github.run_number }}
+          body: |
+            OnePlus 8T (kebab) HydrogenOS11 / Android11 / kernel 4.19.110
+            - Source: OnePlusOSS SM8250_R_11.0
+            - tiann KernelSU + susfs4ksu(kernel-4.19) + non-GKI manual hooks
+            - AnyKernel3: flashes kernel only, keeps stock ramdisk (A/B, current slot)
+            Flash via KernelSU manager / AK3. Fastboot fallback: keep stock boot.img.
+          files: ${{ env.ZIP_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
