@@ -52,6 +52,17 @@ jobs:
           echo "=== kernel version ==="
           head -5 Makefile
 
+      - name: Make legacy gcc-wrapper.py py3-safe (fallback)
+        run: |
+          cd kernel
+          if [ -f scripts/gcc-wrapper.py ]; then
+            # 该 wrapper 是 py2 脚本(print 语句), runner 的 python=py3; 主修复是命令行 CC=clang 绕过它,
+            # 这里再把已知 py2 print 转成 py3 做兜底, 并语法校验, 若还有其它 py2 语法会打印全文供下轮修
+            sed -i 's/print "error, forbidden warning:", m\.group(2)/print("error, forbidden warning:", m.group(2))/' scripts/gcc-wrapper.py
+            python3 -m py_compile scripts/gcc-wrapper.py && echo "wrapper py3-OK" \
+              || { echo "wrapper still py2-invalid:"; nl -ba scripts/gcc-wrapper.py | sed -n '1,80p'; }
+          fi
+
       - name: Clone susfs4ksu (kernel-4.19)
         run: |
           git clone --depth=1 -b kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
@@ -257,11 +268,15 @@ jobs:
         run: |
           cd kernel
           mkdir -p out
-          make O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
+          # 关键: 每一个 make 都必须在命令行带 CC=clang 全套参数。
+          # 否则 Makefile 会把 CC 回落到 scripts/gcc-wrapper.py(py2), 解析 init/Kconfig 的
+          # $(success,$(CC) --version)/$(shell,...$(CC)) 宏时在 py3 runner 上崩, 报 init/Kconfig 语法错。
+          MK="O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            $DEFCONFIG
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1"
+          which clang; clang --version | head -1
+          make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
           for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
             KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
@@ -272,7 +287,7 @@ jobs:
           done
           # 非GKI手动hook需要
           scripts/config --file out/.config -d KPROBES 2>/dev/null || true
-          make O=out ARCH=arm64 olddefconfig
+          make $MK olddefconfig
           echo "=== KSU/SUSFS config ==="
           grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config | head -40
 
