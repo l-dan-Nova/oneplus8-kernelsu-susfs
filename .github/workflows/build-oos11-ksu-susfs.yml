@@ -201,6 +201,15 @@ jobs:
           fi
           echo 'CFLAGS_namespace.o += -Wno-unused-function' >> fs/Makefile
 
+      - name: Backport stpcpy for clang (lib/string.c + linux/string.h)
+        run: |
+          cd kernel
+          # clang 优化会把 strcpy/sprintf 链 lowering 成对 stpcpy 的调用(GCC 不会), 而 OnePlus 4.19 的
+          # lib/string.c 与 include/linux/string.h 均无 stpcpy -> 链接报 undefined symbol: stpcpy。
+          # 由幂等脚本 backport 主线标准实现(锚点唯一/缺失即 exit1), 已在原厂源码副本上验证。
+          python3 "$GITHUB_WORKSPACE/scripts/backport_stpcpy.py"
+          grep -n "stpcpy" lib/string.c include/linux/string.h | head
+
       - name: Setup KernelSU (tiann, PINNED v0.9.5 flat layout)
         run: |
           cd kernel
@@ -350,9 +359,10 @@ jobs:
           MK="O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon \
-            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump STRIP=llvm-strip"
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon"
+          # 链接器/归档工具不显式指定 -> 走 CROSS_COMPILE 的 GNU bfd/binutils(aarch64-linux-android-ld 等)。
+          # Android11 vendor 4.19 原厂组合 = clang 编译 + GNU bfd ld 链接; ld.lld 会对 genksyms 的
+          # __crc_* R_AARCH64_ABS32 绝对重定位报 "recompile with -fPIC", bfd 无此问题。CC 仍是 clang。
           which clang; clang --version | head -1
           make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
@@ -369,10 +379,9 @@ jobs:
           done
           # 非GKI手动hook需要
           scripts/config --file out/.config -d KPROBES 2>/dev/null || true
-          # ★必须与 Build 步骤的工具链一致(含 LD=ld.lld): 否则 olddefconfig 时 LD_IS_LLD=n,
-          # 依赖 LLD 的 LTO_CLANG/RELR 等符号当时不可见、未被落定; Build 一补全 LLVM 变量它们
-          # 就变成 (NEW), 触发交互式 oldconfig, `yes ""` 处理不了 choice 型 LTO -> 空转不链接。
-          # 显式关闭 LTO(又慢又易在 lld 链接翻车) 与 RELR(仅打包优化, 无功能影响), 消除 choice/NEW。
+          # ★Configure 与 Build 的工具链变量必须完全一致(同为 clang 编译 + GNU bfd 链接, 都不指定 LD):
+          # 否则 Kconfig 能力探测(LD_IS_LLD 等)在两步结果不同, 会冒出 (NEW) 交互提问导致空转不链接。
+          # 显式关闭 LTO(又慢又易在链接翻车) 与 RELR(仅打包优化, 无功能影响), 消除 choice/NEW。
           scripts/config --file out/.config -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d LTO_NONE 2>/dev/null || true
           scripts/config --file out/.config -d RELR 2>/dev/null || true
           make $MK olddefconfig
@@ -418,7 +427,6 @@ jobs:
           make O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon \
-            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
             olddefconfig
           # stdin=/dev/null: 若仍有未决 Kconfig 提问会立刻读到 EOF 失败, 而不是被 yes "" 喂空后空转不链接
           set +e
@@ -426,8 +434,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LLVM_IAS=1 HOSTCFLAGS=-fcommon KCFLAGS=-Wno-error LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip < /dev/null 2>&1 | tee build.log
+            LLVM_IAS=1 HOSTCFLAGS=-fcommon KCFLAGS=-Wno-error < /dev/null 2>&1 | tee build.log
           RC=${PIPESTATUS[0]}
           set -e
           echo "=== make exit code: $RC ==="
