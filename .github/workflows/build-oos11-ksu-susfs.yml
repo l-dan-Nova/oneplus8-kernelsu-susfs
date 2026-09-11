@@ -350,7 +350,9 @@ jobs:
           MK="O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon"
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump STRIP=llvm-strip"
           which clang; clang --version | head -1
           make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
@@ -367,7 +369,17 @@ jobs:
           done
           # 非GKI手动hook需要
           scripts/config --file out/.config -d KPROBES 2>/dev/null || true
+          # ★必须与 Build 步骤的工具链一致(含 LD=ld.lld): 否则 olddefconfig 时 LD_IS_LLD=n,
+          # 依赖 LLD 的 LTO_CLANG/RELR 等符号当时不可见、未被落定; Build 一补全 LLVM 变量它们
+          # 就变成 (NEW), 触发交互式 oldconfig, `yes ""` 处理不了 choice 型 LTO -> 空转不链接。
+          # 显式关闭 LTO(又慢又易在 lld 链接翻车) 与 RELR(仅打包优化, 无功能影响), 消除 choice/NEW。
+          scripts/config --file out/.config -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d LTO_NONE 2>/dev/null || true
+          scripts/config --file out/.config -d RELR 2>/dev/null || true
           make $MK olddefconfig
+          # 再跑一次 olddefconfig 必须幂等(不再改动/不再有 NEW); 用其输出兜底确认配置已收敛
+          make $MK olddefconfig
+          echo "=== LTO / RELR (expect '# ... is not set') ==="
+          grep -E "CONFIG_LTO|CONFIG_RELR|CONFIG_ARCH_SUPPORTS_RELR" out/.config || echo "(no LTO/RELR symbols, fine)"
           echo "=== KSU/SUSFS config ==="
           grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY_FS|CONFIG_EXT4_FS" out/.config | head -40
           echo "=== GATE: KernelSU 必须 built-in (=y), 否则就是空壳内核 ==="
@@ -391,15 +403,26 @@ jobs:
           sed -i 's/-Werror-implicit-function-declaration//' Makefile
           echo "=== named cc-option -Werror lines after strip (expect none) ==="
           grep -n "cc-option,-Werror=" Makefile && { echo "FATAL: named -Werror=diag not stripped"; exit 1; } || echo "named -Werror=diag stripped OK"
-          yes "" | make -j$(nproc --all) O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
+          # 编译前再非交互收敛一次配置(工具链变量与编译完全一致), 杜绝残余 (NEW) 交互提问
+          make O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            olddefconfig
+          # stdin=/dev/null: 若仍有未决 Kconfig 提问会立刻读到 EOF 失败, 而不是被 yes "" 喂空后空转不链接
+          set +e
+          make -j$(nproc --all) O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             LLVM_IAS=1 HOSTCFLAGS=-fcommon KCFLAGS=-Wno-error LD=ld.lld AR=llvm-ar NM=llvm-nm \
-            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip 2>&1 | tee build.log
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip < /dev/null 2>&1 | tee build.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "=== make exit code: $RC ==="
           echo "=== result ==="
           ls -la out/arch/arm64/boot/Image* || true
-          if [ ! -f out/arch/arm64/boot/Image ]; then echo "BUILD FAILED"; tail -80 build.log; exit 1; fi
+          if [ "$RC" != "0" ] || [ ! -f out/arch/arm64/boot/Image ]; then echo "BUILD FAILED rc=$RC"; tail -100 build.log; exit 1; fi
 
       - name: Package AnyKernel3 (kernel only, keep stock ramdisk)
         run: |
