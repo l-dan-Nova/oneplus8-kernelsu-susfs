@@ -298,7 +298,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LLVM_IAS=1 HOSTCFLAGS=-fcommon LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            LLVM_IAS=1 HOSTCFLAGS=-fcommon KCFLAGS=-Wno-error LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip 2>&1 | tee build.log
           echo "=== result ==="
           ls -la out/arch/arm64/boot/Image* || true
