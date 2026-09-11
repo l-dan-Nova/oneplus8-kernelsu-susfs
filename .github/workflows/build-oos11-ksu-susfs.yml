@@ -86,14 +86,48 @@ jobs:
       - name: Apply SUSFS kernel patch (4.19)
         run: |
           cd kernel
-          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || echo "Some hunks failed - inspect below"
-          find . -name "*.rej" -print -exec cat {} \; 2>/dev/null || true
-          find . -name "*.rej" -delete 2>/dev/null || true
+          patch -p1 --no-backup-if-mismatch -F3 < $GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch || echo "Some hunks failed - .rej kept for the non-KABI manual-fix step"
+          echo "=== rejected hunks (sched.h/mount.h expected; fixed next) ==="
+          find . -name "*.rej" -print 2>/dev/null || true
           find . -name "*.orig" -delete 2>/dev/null || true
           if ! grep -q "susfs.o" fs/Makefile; then
             sed -i '/^obj-y.*:=/a obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile
           fi
           grep -n "susfs" fs/Makefile || true
+
+      - name: Manually add SUSFS fields to non-KABI sched.h/mount.h (OnePlus 4.19 has no ANDROID_KABI_RESERVE)
+        run: |
+          cd kernel
+          # 已用 patch -F3 在与 OnePlus R_11 完全一致的源码上验证: 50 补丁仅 sched.h/mount.h
+          # 两个 hunk 失配(它们靠 GKI 的 ANDROID_KABI_RESERVE 锚点, 而本内核无此机制)。
+          # 对非 KABI 内核, 补丁本意是在 CONFIG_KSU_SUSFS 下直接补 u64 成员, 这里按其本意手动补。
+          python3 - <<'PYEOF'
+          p="include/linux/sched.h"
+          s=open(p,encoding="utf-8").read()
+          if "susfs_task_state" not in s:
+              anchor="\trandomized_struct_fields_end"
+              assert anchor in s, "sched.h randomized_struct_fields_end anchor missing"
+              ins="#if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_task_state;\n\tu64 susfs_last_fake_mnt_id;\n#endif\n"
+              s=s.replace(anchor, ins+anchor, 1)
+              open(p,"w",encoding="utf-8").write(s)
+              print("sched.h patched")
+          p="include/linux/mount.h"
+          s=open(p,encoding="utf-8").read()
+          if "susfs_mnt_id_backup" not in s:
+              anchor="\tint mnt_flags;\n\tvoid *data;\n} __randomize_layout;"
+              assert anchor in s, "mount.h vfsmount anchor missing"
+              repl="\tint mnt_flags;\n#if defined(CONFIG_KSU_SUSFS)\n\tu64 susfs_mnt_id_backup;\n#endif\n\tvoid *data;\n} __randomize_layout;"
+              s=s.replace(anchor, repl, 1)
+              open(p,"w",encoding="utf-8").write(s)
+              print("mount.h patched")
+          print("OK non-KABI SUSFS fields")
+          PYEOF
+          rm -f include/linux/sched.h.rej include/linux/mount.h.rej
+          echo "=== verify sched.h ==="; grep -n "susfs_task_state\|susfs_last_fake_mnt_id" include/linux/sched.h
+          echo "=== verify mount.h ==="; grep -n "susfs_mnt_id_backup" include/linux/mount.h
+          echo "=== any OTHER remaining .rej = unexpected hunk failure -> abort ==="
+          if find . -name "*.rej" | grep -q .; then find . -name "*.rej" -print -exec cat {} \;; exit 1; fi
+          echo "no remaining rejects"
 
       - name: Backport path_umount / can_umount / get_cred_rcu for 4.19
         run: |
