@@ -274,7 +274,7 @@ jobs:
           MK="O=out ARCH=arm64 OEM_TARGET_PRODUCT=$OEM_PRODUCT CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1"
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- LLVM_IAS=1 HOSTCFLAGS=-fcommon"
           which clang; clang --version | head -1
           make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
@@ -298,7 +298,7 @@ jobs:
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            LLVM_IAS=1 HOSTCFLAGS=-fcommon LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip 2>&1 | tee build.log
           echo "=== result ==="
           ls -la out/arch/arm64/boot/Image* || true
