@@ -253,6 +253,18 @@ jobs:
             fi
           done
           echo "ccflags-y += -DKSU_UMOUNT" >> Makefile
+          # ★关键: 新版 tiann KernelSU 的 Kconfig 写的是 `config KSU depends on KPROBES && EXT4_FS`。
+          # 手动 hook 模式我们关掉了 KPROBES, 若不删这个依赖, olddefconfig 会把 CONFIG_KSU=y
+          # 直接清掉 -> drivers/kernelsu 不参与编译 -> 编出一个不含 KernelSU 的空壳内核。
+          echo "=== KSU Kconfig depends BEFORE ==="
+          grep -n "depends on" Kconfig | head
+          sed -i -E 's/depends on[[:space:]]+KPROBES[[:space:]]*&&[[:space:]]*EXT4_FS/depends on EXT4_FS/' Kconfig
+          sed -i -E 's/^[[:space:]]*depends on[[:space:]]+KPROBES[[:space:]]*$//' Kconfig
+          echo "=== KSU Kconfig AFTER ==="
+          grep -n -A3 "^config KSU$" Kconfig
+          if grep -q "depends on.*KPROBES" Kconfig; then
+            echo "FATAL: KSU Kconfig still depends on KPROBES"; exit 1
+          fi
 
       - name: Add manual KSU hooks for non-GKI
         run: |
@@ -278,6 +290,8 @@ jobs:
           which clang; clang --version | head -1
           make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
+          # KSU 的 Kconfig 依赖 EXT4_FS, 确保 ext4 内建
+          scripts/config --file out/.config -e EXT4_FS
           for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
             KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
             KSU_SUSFS_SUS_KSTAT KSU_SUSFS_TRY_UMOUNT KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
@@ -289,7 +303,16 @@ jobs:
           scripts/config --file out/.config -d KPROBES 2>/dev/null || true
           make $MK olddefconfig
           echo "=== KSU/SUSFS config ==="
-          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config | head -40
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_EXT4_FS" out/.config | head -40
+          echo "=== GATE: KernelSU 必须 built-in (=y), 否则就是空壳内核 ==="
+          if ! grep -q "^CONFIG_KSU=y" out/.config; then
+            echo "FATAL: CONFIG_KSU != y after olddefconfig (Kconfig 依赖修复未生效), 终止以免白编译"
+            grep -n -A3 "^config KSU$" drivers/kernelsu/Kconfig
+            exit 1
+          fi
+          echo "OK: CONFIG_KSU=y, KernelSU 将被内建编译"
+          grep -c "kernelsu" drivers/Makefile
+          grep -n "kernelsu/Kconfig" drivers/Kconfig
 
       - name: Build Kernel
         run: |
