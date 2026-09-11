@@ -2,7 +2,8 @@ name: Build OOS11 kebab KernelSU+SUSFS (4.19 non-GKI)
 
 # 为 一加8T(kebab) 氢OS11 / Android11 / 内核 4.19.110 定制
 # 源码: OnePlusOSS SM8250_R_11.0 (4.19.110) ; defconfig: vendor/kona-perf_defconfig ; OEM_TARGET_PRODUCT=kebab
-# 组合: tiann KernelSU + susfs4ksu(kernel-4.19) + 非GKI手动hook ; 产物仅 AnyKernel3(只换kernel, 保留原厂ramdisk)
+# 组合: tiann KernelSU PINNED v0.9.5(扁平结构, 兼容SUSFS10补丁/官方non-GKI手动hook) + susfs4ksu(kernel-4.19)
+#       + 官方 v0.9.5 non-GKI 6处手动hook(scripts/apply_ksu_hooks.py) ; 产物仅 AnyKernel3(只换kernel, 保留原厂ramdisk)
 on:
   workflow_dispatch:
 
@@ -193,12 +194,20 @@ jobs:
           fi
           echo 'CFLAGS_namespace.o += -Wno-unused-function' >> fs/Makefile
 
-      - name: Setup KernelSU (tiann)
+      - name: Setup KernelSU (tiann, PINNED v0.9.5 flat layout)
         run: |
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          # 必须 pin v0.9.5: 最新 release(v3.x)已重构为分层目录且无 ksu_handle_* 手动hook接口,
+          # 与非GKI手动hook/SUSFS 10补丁(按扁平 core_hook.c/ksud.c 生成)均不兼容。
+          # v0.9.5 已离线验证: SUSFS 10补丁 0-rej, 官方 non-GKI 手册6处hook函数全部存在且签名一致。
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
           if [ ! -d "drivers/kernelsu" ]; then echo "ERROR: KernelSU setup failed!"; exit 1; fi
-          ls -la drivers/kernelsu/ | head
+          echo "=== pinned KSU driver contents (expect FLAT: core_hook.c ksu.c ksud.c sucompat.c) ==="
+          ls -la drivers/kernelsu/ | head -30
+          for must in core_hook.c ksu.c ksud.c sucompat.c; do
+            [ -f "drivers/kernelsu/$must" ] || { echo "FATAL: drivers/kernelsu/$must missing (wrong KSU version?)"; exit 1; }
+          done
+          grep -n "int ksu_handle_execveat(" drivers/kernelsu/ksu.c
 
       - name: Apply SUSFS patch to KernelSU driver
         run: |
@@ -208,10 +217,14 @@ jobs:
           if [ -f "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
             cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" "$KSU_PARENT/"
             cd "$KSU_PARENT"
-            patch -p1 -F3 --dry-run < 10_enable_susfs_for_ksu.patch 2>&1 || true
-            patch -p1 -F3 < 10_enable_susfs_for_ksu.patch 2>&1 || true
-            find . -name "*.rej" -delete 2>/dev/null || true
+            patch -p1 -F3 --dry-run < 10_enable_susfs_for_ksu.patch 2>&1 | tail -5 || true
+            # v0.9.5 已离线验证全部 hunk 命中、0-rej; 因此正式打补丁后若残留 .rej 属异常, 直接失败而非掩盖
+            patch -p1 -F3 < 10_enable_susfs_for_ksu.patch
+            if find . -name "*.rej" | grep -q .; then
+              echo "FATAL: SUSFS 10 patch has rejects on pinned KSU:"; find . -name "*.rej" -print -exec cat {} \;; exit 1
+            fi
             find . -name "*.orig" -delete 2>/dev/null || true
+            echo "SUSFS 10 patch applied cleanly to KSU v0.9.5"
             rm -f 10_enable_susfs_for_ksu.patch
           fi
           cd "$GITHUB_WORKSPACE/kernel"
@@ -287,28 +300,38 @@ jobs:
             fi
           done
           echo "ccflags-y += -DKSU_UMOUNT" >> Makefile
-          # ★关键: 新版 tiann KernelSU 的 Kconfig 写的是 `config KSU depends on KPROBES && EXT4_FS`。
-          # 手动 hook 模式我们关掉了 KPROBES, 若不删这个依赖, olddefconfig 会把 CONFIG_KSU=y
-          # 直接清掉 -> drivers/kernelsu 不参与编译 -> 编出一个不含 KernelSU 的空壳内核。
+          # Kconfig 依赖兼容: pinned v0.9.5 的 config KSU 是 `depends on OVERLAY_FS`(本就不依赖 KPROBES);
+          # 下面两条 sed 仅用于万一拉到别的版本(新版写 KPROBES && EXT4_FS)时兜底, 对 v0.9.5 是 no-op。
+          # 绝不能删掉 OVERLAY_FS 依赖; Configure 阶段会显式 -e OVERLAY_FS, 否则 CONFIG_KSU 被清成空壳。
           echo "=== KSU Kconfig depends BEFORE ==="
           grep -n "depends on" Kconfig | head
-          sed -i -E 's/depends on[[:space:]]+KPROBES[[:space:]]*&&[[:space:]]*EXT4_FS/depends on EXT4_FS/' Kconfig
+          sed -i -E 's/depends on[[:space:]]+KPROBES[[:space:]]*&&[[:space:]]*EXT4_FS/depends on OVERLAY_FS/' Kconfig
           sed -i -E 's/^[[:space:]]*depends on[[:space:]]+KPROBES[[:space:]]*$//' Kconfig
-          echo "=== KSU Kconfig AFTER ==="
+          echo "=== KSU Kconfig AFTER (config KSU must depend on OVERLAY_FS) ==="
           grep -n -A3 "^config KSU$" Kconfig
-          if grep -q "depends on.*KPROBES" Kconfig; then
-            echo "FATAL: KSU Kconfig still depends on KPROBES"; exit 1
+          if ! grep -A3 "^config KSU$" Kconfig | grep -q "OVERLAY_FS"; then
+            echo "FATAL: config KSU missing OVERLAY_FS dependency on pinned v0.9.5"; exit 1
           fi
 
-      - name: Add manual KSU hooks for non-GKI
+      - name: Add official v0.9.5 non-GKI manual KSU hooks
         run: |
           cd kernel
-          bash $GITHUB_WORKSPACE/scripts/add-ksu-hooks.sh
-          echo "=== hook anchor verification ==="
-          echo "-- exec.c:"; grep -c "ksu_handle_execveat" fs/exec.c || true
-          echo "-- open.c:"; grep -c "ksu_handle_faccessat" fs/open.c || true
-          echo "-- stat.c:"; grep -c "ksu_handle_stat" fs/stat.c || true
-          echo "-- reboot.c:"; grep -c "ksu_handle_sys_reboot" kernel/reboot.c || true
+          # 用官方 v0.9.5 non-GKI 手册的6处正确hook(exec/open/stat/read_write/devpts/input),
+          # 替代构建器自带 add-ksu-hooks.sh(它引用了主线从不存在的 ksu_handle_sys_reboot、
+          # 且 exec 三路重复调用 ksud, 必在链接期 undefined reference)。脚本幂等且锚点缺失即失败。
+          python3 $GITHUB_WORKSPACE/scripts/apply_ksu_hooks.py "$(pwd)"
+          echo "=== hook anchor verification (each must be >=1) ==="
+          for pair in "fs/exec.c:ksu_handle_execveat" "fs/open.c:ksu_handle_faccessat" \
+                      "fs/stat.c:ksu_handle_stat" "fs/read_write.c:ksu_handle_vfs_read" \
+                      "fs/devpts/inode.c:ksu_handle_devpts" "drivers/input/input.c:ksu_handle_input_handle_event"; do
+            f="${pair%%:*}"; s="${pair##*:}"; n=$(grep -c "$s" "$f"); echo "-- $f -> $s = $n"
+            [ "$n" -ge 1 ] || { echo "FATAL: hook $s missing in $f"; exit 1; }
+          done
+          # v0.9.5 supercall 不走 reboot, 内核里不应出现该幽灵符号
+          if grep -q "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null; then
+            echo "FATAL: unexpected ksu_handle_sys_reboot in reboot.c"; exit 1
+          fi
+          echo "all 6 official manual hooks present, no ghost reboot hook"
 
       - name: Configure (vendor/kona-perf_defconfig + kebab)
         run: |
@@ -324,7 +347,9 @@ jobs:
           which clang; clang --version | head -1
           make $MK $DEFCONFIG
           scripts/config --file out/.config -e KSU
-          # KSU 的 Kconfig 依赖 EXT4_FS, 确保 ext4 内建
+          # ★pinned v0.9.5 的 config KSU `depends on OVERLAY_FS`, 必须显式开 OVERLAY_FS,
+          # 否则 olddefconfig 会把 CONFIG_KSU=y 清掉 -> 空壳内核。EXT4_FS 一并保底。
+          scripts/config --file out/.config -e OVERLAY_FS
           scripts/config --file out/.config -e EXT4_FS
           for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT \
             KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
@@ -337,7 +362,7 @@ jobs:
           scripts/config --file out/.config -d KPROBES 2>/dev/null || true
           make $MK olddefconfig
           echo "=== KSU/SUSFS config ==="
-          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_EXT4_FS" out/.config | head -40
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY_FS|CONFIG_EXT4_FS" out/.config | head -40
           echo "=== GATE: KernelSU 必须 built-in (=y), 否则就是空壳内核 ==="
           if ! grep -q "^CONFIG_KSU=y" out/.config; then
             echo "FATAL: CONFIG_KSU != y after olddefconfig (Kconfig 依赖修复未生效), 终止以免白编译"
